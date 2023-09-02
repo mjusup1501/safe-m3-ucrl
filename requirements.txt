@@ -1,0 +1,6 @@
+numpy>=1.19.5
+pyyaml>=5.4.1
+torch>=1.12.1
+torchist>=0.1.7
+tqdm>=4.62.3
+wandb>=0.13.10
