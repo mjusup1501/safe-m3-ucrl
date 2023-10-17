@@ -1,9 +1,9 @@
-env_name: vehicle_repositioning_sequential
+env_name: vehicle-repositioning-sequential
 logging: offline
 device: cuda:0
 entity: user
 logdir: 
-run_id: 20220516
+run_id: 20230516
 dynamics_ckpt: 
 policy_ckpt: policy.pt
 exec_type: eval
@@ -39,7 +39,7 @@ model:
       weight_decay: 0.0005
     reset_params_every_episode: True
     patience: 1
-    action_std: 0.5
+    exploration_decay: 0.5
     polar: false
     gmm: false
 

@@ -49,8 +49,9 @@ def main():
         device = "cpu"
 
     alg = SafeMFMARL(
-            env_name=config.get("env_name", "vehicle_repositioning_sequential"),
+            env_name=config.get("env_name", "vehicle-repositioning-sequential"),
             **config["model"], 
+            delta=1 / config["training"]["horizon"],
             device=device,
             log_dir=log_dir,
             dynamics_ckpt=config.get("dynamics_ckpt", None),

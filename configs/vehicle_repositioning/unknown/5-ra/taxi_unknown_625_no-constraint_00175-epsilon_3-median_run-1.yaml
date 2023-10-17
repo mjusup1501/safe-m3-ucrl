@@ -1,4 +1,4 @@
-env_name: vehicle_repositioning_sequential
+env_name: vehicle-repositioning-sequential
 logging: offline
 device: cuda:0
 entity: user
@@ -39,7 +39,7 @@ model:
       weight_decay: 0.0005
     reset_params_every_episode: False
     patience: 5
-    action_std: 0.5
+    exploration_decay: 
     polar: false
     gmm: false
 

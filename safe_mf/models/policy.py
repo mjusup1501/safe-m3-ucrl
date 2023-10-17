@@ -1,4 +1,5 @@
 import math
+import random
 from typing import Optional, Tuple, List
 
 import torch
@@ -6,6 +7,7 @@ import torch.nn as nn
 from safe_mf.utils.distributions import shifted_uniform
 
 from safe_mf.utils.data import (
+    denormalize_actions,
     normalize_mus,
     normalize_states,
 )
@@ -49,6 +51,18 @@ class OptimalSwarm1DPolicy(nn.Module):
         return 2 * torch.pi * torch.cos(2 * torch.pi * states)
 
 
+class TanhScaled(nn.Module):
+    def __init__(self, scaling_factor):
+        super(TanhScaled, self).__init__()
+        self.tanh = nn.Tanh()
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        tanh_output = self.tanh(x)
+        scaled_output = self.scaling_factor * tanh_output
+        return scaled_output
+
+
 class MFPolicy(nn.Module):
     def __init__(
         self,
@@ -61,6 +75,7 @@ class MFPolicy(nn.Module):
         action_space: Tuple[float, float],
         gmm: bool,
         polar: bool,
+        state_space_normalizer: Optional[Tuple[float, float]] = None
     ) -> None:
         super().__init__()
         assert len(hidden_dims) > 0
@@ -72,6 +87,10 @@ class MFPolicy(nn.Module):
         self.action_space = action_space
         self.gmm = gmm
         self.polar = polar
+        if state_space_normalizer is None:
+            self.state_space_normalizer = state_space
+        else:
+            self.state_space_normalizer = state_space_normalizer
 
         final_dim = state_dim + action_dim if hallucinated_control else action_dim
         s_dim = 2 * state_dim if self.polar else state_dim
@@ -79,8 +98,8 @@ class MFPolicy(nn.Module):
         self.model = [nn.Linear(s_dim + m_dim, hidden_dims[0])]
         dims = hidden_dims + [final_dim]
         for i in range(len(dims) - 1):
-            self.model += [nn.LeakyReLU(), nn.Linear(dims[i], dims[i + 1])]
-        self.model += [nn.Tanh()]
+            self.model += [nn.BatchNorm1d(dims[i]), nn.LeakyReLU(), nn.Linear(dims[i], dims[i + 1])]
+        self.model += [nn.Tanh()] 
         self.model = nn.Sequential(*self.model)
         self.reset_parameters()
 
@@ -107,7 +126,7 @@ class MFPolicy(nn.Module):
         if states.shape[0] == mu.shape[0]:
             inputs = torch.cat(
                 (
-                    normalize_states(states, self.state_space, polar=self.polar),
+                    normalize_states(states, self.state_space_normalizer, polar=self.polar),
                     normalize_mus(mu, gmm=self.gmm),
                 ),
                 dim=1,
@@ -115,17 +134,37 @@ class MFPolicy(nn.Module):
         elif mu.shape[0] == 1:
             inputs = torch.cat(
                 (
-                    normalize_states(states, self.state_space, polar=self.polar),
+                    normalize_states(states, self.state_space_normalizer, polar=self.polar),
                     normalize_mus(mu, gmm=self.gmm).expand(states.shape[0], -1),
                 ),
                 dim=1,
             )
         else:
-            norm_states = normalize_states(states, self.state_space, polar=self.polar)
+            norm_states = normalize_states(states, self.state_space_normalizer, polar=self.polar)
             norm_states = norm_states.repeat(mu.shape[0], 1, 1)
             norm_mu = normalize_mus(mu, gmm=self.gmm)
             norm_mu = norm_mu.unsqueeze(1).repeat(1, norm_states.shape[1], 1)
             inputs = torch.cat((norm_states, norm_mu), dim=2)
             inputs = inputs.reshape(-1, inputs.shape[2])
+        outputs = self.model(inputs)
+        # Scale [-1, 1] to [-action_space, action_space]
+        # Assumes symmetric action space around 0
+        true_actions = outputs[:, :self.action_dim]
+        true_actions = denormalize_actions(true_actions, self.action_space)
+        hallucinated_actions = outputs[:, self.action_dim:] if self.hallucinated_control else None
+        if explore:
+            mask = torch.rand(true_actions.shape, device=outputs.device) < explore
+            noise = shifted_uniform(low=-explore, high=explore, size=true_actions.shape, device=outputs.device)
+            # We scale it up based on the action space
+            true_noise = noise * self.action_space[1]
+            true_actions = true_actions * ~mask + true_noise * mask
+            true_actions = torch.clamp(true_actions, min=self.action_space[0], max=self.action_space[1])
+            if hallucinated_actions is not None:
+                hallucinated_actions = hallucinated_actions * ~mask + noise * mask
+                hallucinated_actions = torch.clamp(hallucinated_actions, min=-1.0, max=1.0)
+        if hallucinated_actions is None:
+            actions = true_actions
+        else:
+            actions = torch.cat((true_actions, hallucinated_actions), dim=1)
         
-        return self.model(inputs)
+        return actions

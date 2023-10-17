@@ -43,8 +43,11 @@ class VehicleRepositioningSequential(Env):
         # When all rows in the demand matrix are 0 we want agents to stay in the current cell
         # The logic is necessary for representative agent move in get_demand_states()
         self.demand_move_matrix = demand_matrix.clone()
-        mask = torch.all(self.demand_matrix == 0, dim=1).nonzero().flatten()
-        self.demand_move_matrix[mask, mask] = 1.
+        mask = torch.all(self.demand_matrix == 0, dim=-1).nonzero()
+        if self.demand_move_matrix.ndim == 2:
+            self.demand_move_matrix[mask[:, 0], mask[:, 0]] = 1.
+        else:
+            self.demand_move_matrix[mask[:, 0], mask[:, 1], mask[:, 1]] = 1.
         self.state_space = state_space
         self.action_space = action_space
         self.constraint_lipschitz = constraint_lipschitz
@@ -100,7 +103,7 @@ class VehicleRepositioningSequential(Env):
 
     def reset(self) -> None:
         self.mu = torch.ones(size=(self.mu_dim,), device=self.device).reshape(1, -1) / self.mu_dim
-        self.mu /= self.mu.sum()
+        self.mu = torch.nn.functional.normalize(self.mu, p=1)
         # Representative agent
         self.ra_states = shifted_uniform(
                             low=self.state_space[0], 
@@ -109,7 +112,7 @@ class VehicleRepositioningSequential(Env):
                             device=self.device
                             )
         if self.constraint_function is not None and self.dynamics is not None:
-            self.acc_uncertainty = 0.0
+            self.acc_uncertainty = torch.tensor(0.0, device=self.device)
         else:
             self.acc_uncertainty = None
 
@@ -124,11 +127,15 @@ class VehicleRepositioningSequential(Env):
         return demand_states
 
 
-    def get_demand_states(self, states, ra_move=False):
+    def get_demand_states(self, states, ra_move=False, step: Optional[int] = None):
         if self.demand_move and ra_move:
+            if self.demand_move_matrix.ndim == 2:
+                demand_move_matrix = self.demand_move_matrix
+            else:
+                demand_move_matrix = self.demand_move_matrix[step]
             cells = states_to_cell(states, self.linspace_x, self.linspace_y)
             origins_idx = cells_to_index(cells, self.num_intervals)
-            transition_probs = self.demand_move_matrix[origins_idx, :]
+            transition_probs = demand_move_matrix[origins_idx, :]
             destinations_idx = torch.multinomial(transition_probs, 1).squeeze(1)
             demand_states = self.move_demand_to_destinations(destinations_idx)
         else:
@@ -141,6 +148,9 @@ class VehicleRepositioningSequential(Env):
 
 
     def get_next_states(self, current_states, actions, mf_transition: bool=False):
+        # Unlike swarm environment, here we don't have delta * actions meaning that
+        # the next state can be obtained using the identical logic in true and
+        # approximated dynamics
         next_states = current_states + actions 
         next_states = torch.clamp(next_states, self.state_space[0], self.state_space[1])
         if mf_transition:
@@ -163,9 +173,11 @@ class VehicleRepositioningSequential(Env):
         if self.demand_move:
             if self.demand_matrix.ndim == 2:
                 demand_matrix = self.demand_matrix
-                target_mu = self.target_mu
             else:
                 demand_matrix = self.demand_matrix[step]
+            if self.target_mu.ndim == 2:
+                target_mu = self.target_mu
+            else:
                 target_mu = self.target_mu[step]
             one = torch.tensor(1, device=self.device)
             mu_ = torch.log(mu + 1e-30)
@@ -174,7 +186,7 @@ class VehicleRepositioningSequential(Env):
             demand_move = (mu * p) @ demand_matrix
             pending_supply = mu * (1 - p)
             mu = demand_move + pending_supply
-            mu /= mu.sum(dim=1, keepdim=True)
+            mu = torch.nn.functional.normalize(mu, p=1)
 
         return mu
 
@@ -183,12 +195,12 @@ class VehicleRepositioningSequential(Env):
         states: torch.Tensor,  # [?, state_dim]
         mu: torch.Tensor,  # [1, mu_dim]
         policy: MFPolicy,
-        action_std: Optional[float],
+        exploration: Optional[float],
         grid_actions: Optional[torch.Tensor] = None,
         mf_transition: bool = False
     ) -> torch.Tensor:
         act_dim = self.action_dim
-        actions = policy(states, mu, action_std)
+        actions = policy(states, mu, exploration)
         true_actions = actions[:, :act_dim]
         next_states = self.get_next_states(states, true_actions, mf_transition)
 
@@ -200,11 +212,11 @@ class VehicleRepositioningSequential(Env):
         states: torch.Tensor,  # [?, state_dim]
         mu: torch.Tensor,  # [1, mu_dim]
         policy: MFPolicy,
-        action_std: Optional[float],
+        exploration: Optional[float],
         grid_actions: Optional[torch.Tensor] = None,
         mf_transition: bool = False
     ) -> torch.Tensor:
-        actions = policy(states, mu, action_std)
+        actions = policy(states, mu, exploration)
         act_dim = self.action_dim
         true_actions = actions[:, :act_dim]
         hallucinated_actions = actions[:, act_dim:]
@@ -266,7 +278,7 @@ class VehicleRepositioningSequential(Env):
         policy: MFPolicy,
         step: Optional[int] = None,
         known_dynamics: bool = True,
-        action_std: Optional[float] = None,
+        exploration: Optional[float] = None,
         policy_training: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         dynamics = self._true_dynamics if known_dynamics else self._approximate_dynamics
@@ -274,24 +286,24 @@ class VehicleRepositioningSequential(Env):
         current_mu = self.mu
 
         demand_mu = self.get_demand_mu(current_mu, step) #.detach().clone())
-        grid_demand_states = self.get_demand_states(self.cell_centers, ra_move=False)
+        grid_demand_states = self.get_demand_states(self.cell_centers, ra_move=False, step=step)
         grid_actions, grid_next_states = dynamics(
                 grid_demand_states,
                 demand_mu,
                 policy,
-                action_std,
+                exploration,
                 mf_transition=True
             )
         true_grid_actions = grid_actions[:, :self.action_dim]
         # Collect data for eval, i.e., when not training policy
         if not policy_training:
             with torch.no_grad():
-                ra_demand_states = self.get_demand_states(ra_current_states, ra_move=True)
+                ra_demand_states = self.get_demand_states(ra_current_states, ra_move=True, step=step)
                 ra_actions, ra_next_states = dynamics(
                     ra_demand_states,
                     demand_mu,
                     policy,
-                    action_std,
+                    exploration,
                     grid_actions,
                     mf_transition=False
                 )
@@ -367,7 +379,7 @@ class VehicleRepositioningSequential(Env):
         # We need to transpose next_mu to match our shape
         next_mu = next_mu.T
         next_mu = next_mu.to(self.device).float().reshape(1, -1)
-        next_mu /= next_mu.sum()
+        next_mu = torch.nn.functional.normalize(next_mu, p=1)
         next_states = next_states.to(self.device)
 
         return next_mu

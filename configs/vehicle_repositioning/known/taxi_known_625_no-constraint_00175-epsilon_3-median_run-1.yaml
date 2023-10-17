@@ -3,7 +3,7 @@ logging: offline
 device: cuda:0
 entity: user
 logdir: 
-run_id: 20230516
+run_id: 20230513
 dynamics_ckpt: 
 policy_ckpt:
 exec_type: train
@@ -13,10 +13,10 @@ model:
   input_data_path: 
   control_std: 0.0175
   constraint_lipschitz: 0.1
-  max_entropy_ratio: 0.85 # pct of max entropy
-  barrier_lambda: 1.0
+  max_entropy_ratio: 0.0 # pct of max entropy
+  barrier_lambda: 0.0
   demand_move: True
-  dynamics_type: unknown
+  dynamics_type: known
   num_agents: 1
   reward_type: current_mu
 
@@ -38,7 +38,7 @@ model:
       hidden_dims: [256, 256]
       weight_decay: 0.0005
     reset_params_every_episode: False
-    patience: 5
+    patience: 20
     exploration_decay:
     polar: false
     gmm: false

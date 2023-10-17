@@ -6,9 +6,11 @@ import numpy as np
 import torch
 import wandb
 from copy import deepcopy
+import re
 
 from safe_mf.envs.vehicle_repositioning_sequential import VehicleRepositioningSequential
-from safe_mf.envs.swarm_1d import Swarm1D
+from safe_mf.envs.swarm_1d_linear import Swarm1DLinear
+from safe_mf.envs.swarm_1d_toroidal import Swarm1DToroidal
 from safe_mf.models.gradient_descent import GradientDescent
 from safe_mf.models.policy import MFPolicy, RandomPolicy, OptimalSwarm1DPolicy
 from safe_mf.utils.entropy import entropic_constraint, max_entropy, entropy as entropy_func
@@ -50,6 +52,7 @@ class SafeMFMARL:
         self.solver_cfg = solver
         self.hallucinated_control = self.dynamics_type == "unknown"
         self.num_agents = num_agents
+        self.evaluations_count = 0
         self.log_dir = log_dir
         self.policy_ckpt_dir = log_dir / "checkpoints" / "policy"
         self.dynamics_ckpt_dir = log_dir / "checkpoints" / "dynamics"
@@ -65,16 +68,18 @@ class SafeMFMARL:
                 policy_ckpt = find_best_ckpt(self.policy_ckpt_dir)
             if policy_ckpt == 'policy.pt':
                 policy_ckpt = find_last_ckpt(self.policy_ckpt_dir)
+            self.evaluations_count = int(re.findall(r'\d+', policy_ckpt)[0])
             self.policy_ckpt = self.policy_ckpt_dir / policy_ckpt
         else:
             self.policy_ckpt = None
         if dynamics_ckpt is not None:
+            self.evaluations_count = max(self.evaluations_count, int(re.findall(r'\d+', dynamics_ckpt)[0]))
             self.dynamics_ckpt = self.dynamics_ckpt_dir / dynamics_ckpt
         else:
             self.dynamics_ckpt = None
         self.exec_type = exec_type
 
-        if self.env_name == "vehicle_repositioning_sequential":
+        if self.env_name == "vehicle-repositioning-sequential":
             assert input_data_path is not None, "input_data_path must be specified for vehicle repositioning environment"
             input_data_path = Path(input_data_path)
             target_mu = np.load(input_data_path / 'target_mu.npy')
@@ -97,8 +102,23 @@ class SafeMFMARL:
                 num_agents=num_agents,
                 reward_type=reward_type
             )
-        elif self.env_name == "swarm-1d":
-            self.env = Swarm1D(
+        elif self.env_name == "swarm-1d-linear":
+            self.env = Swarm1DLinear(
+                mu_dim,
+                delta,
+                control_std,
+                constraint_lipschitz,
+                barrier_lambda,
+                dynamics if self.hallucinated_control else None,
+                self.constraint_function,
+                device=device,
+                dynamics_ckpt=self.dynamics_ckpt,
+                exec_type=self.exec_type,
+                num_agents=num_agents,
+                reward_type=reward_type
+            )
+        elif self.env_name == "swarm-1d-toroidal":
+            self.env = Swarm1DToroidal(
                 mu_dim,
                 delta,
                 control_std,
@@ -113,15 +133,15 @@ class SafeMFMARL:
                 reward_type=reward_type
             )
         self.model = GradientDescent(
-            self.env, self.device, self.hallucinated_control, **self.solver_cfg
+            self.env, self.device, self.hallucinated_control, 
+            policy_ckpt=self.policy_ckpt, **self.solver_cfg
         )
-
-        self.count_evaluations = 0
 
 
     def _warmup(
         self,
         n_transitions: int,
+        horizon: int
     ):
         if n_transitions < 2:
             return
@@ -131,14 +151,15 @@ class SafeMFMARL:
             self.device,
         )
         episode_current_states, episode_current_mus, episode_true_actions, episode_next_states = [], [], [], []
-        self.env.reset()
-        for step in range(n_transitions + 1):
-            current_states, demand_states, next_states, current_mu, demand_mu, next_mu, true_actions, integrated_reward \
-                = self.env.step(policy, step, known_dynamics=True, policy_training=False)
-            episode_current_states.append(demand_states)
-            episode_current_mus.append(demand_mu.repeat_interleave(self.num_agents, dim=0))
-            episode_true_actions.append(true_actions)
-            episode_next_states.append(next_states)
+        for _ in range(n_transitions + 1):
+            self.env.reset()
+            for step in range(horizon):
+                current_states, demand_states, next_states, current_mu, demand_mu, next_mu, true_actions, integrated_reward \
+                    = self.env.step(policy, step, known_dynamics=True, policy_training=False)
+                episode_current_states.append(demand_states)
+                episode_current_mus.append(demand_mu.repeat_interleave(self.num_agents, dim=0))
+                episode_true_actions.append(true_actions)
+                episode_next_states.append(next_states)
 
         episode_current_states = torch.cat(episode_current_states, dim=0)
         episode_current_mus = torch.cat(episode_current_mus, dim=0)
@@ -175,13 +196,13 @@ class SafeMFMARL:
         train_current_mus, train_true_actions = [], []
         with torch.no_grad():
             policy.eval()
-            for step in range(n_repeats):
+            for _ in range(n_repeats):
                 self.env.reset()
                 episode_current_states, episode_demand_states, episode_next_states = [], [], []
                 episode_current_mus, episode_demand_mus = [], [] 
                 episode_true_actions, episode_integrated_rewards = [], []
                 episode_constraint_violations, episode_entropies = [], []
-                for _ in range(horizon):
+                for step in range(horizon):
                     current_states, demand_states, next_states, current_mu, \
                     demand_mu, next_mu, true_actions, integrated_reward = self.env.step(
                         policy, step, known_dynamics=True, policy_training=False
@@ -197,7 +218,7 @@ class SafeMFMARL:
                     if self.constraint_function is not None:
                         episode_constraint_violations.append(self._compute_constraint_violation(current_mu))
 
-                if self.env_name == "vehicle_repositioning_sequential":
+                if self.env_name == "vehicle-repositioning-sequential":
                     train_current_states.extend(episode_demand_states)
                     train_current_mus.extend(episode_demand_mus)            
                 else:
@@ -211,7 +232,7 @@ class SafeMFMARL:
                 episode_current_mus.append(next_mu)
                 visualization_mus.append(torch.stack(episode_current_mus).squeeze(1).cpu().numpy())
 
-                if self.env_name == "vehicle_repositioning_sequential":
+                if self.env_name == "vehicle-repositioning-sequential":
                     # Add dummy demand state to align the dimensions
                     episode_demand_mus.append(next_mu)
                     visualization_demand_mus.append(torch.stack(episode_demand_mus).squeeze(1).cpu().numpy())
@@ -231,31 +252,29 @@ class SafeMFMARL:
                 if self.exec_type == 'eval':
                     episode_current_states.append(next_states)
                     visualization_ra_states.append(torch.stack(episode_current_states).cpu().numpy())
-                    if self.env_name == "vehicle_repositioning_sequential":
+                    if self.env_name == "vehicle-repositioning-sequential":
                         episode_demand_states.append(next_states)
                         visualization_ra_demand_states.append(torch.stack(episode_demand_states).cpu().numpy())
       
-        np.save(self.results_dir / f"integrated_rewards{self.count_evaluations}", visualization_integrated_rewards)
-        np.save(self.results_dir / f"entropies{self.count_evaluations}", visualization_entropies)
+        np.save(self.results_dir / f"integrated_rewards{self.evaluations_count}", visualization_integrated_rewards)
+        np.save(self.results_dir / f"entropies{self.evaluations_count}", visualization_entropies)
 
         if self.constraint_function is not None:
-            np.save(self.results_dir / f"constraint_violations{self.count_evaluations}", visualization_constraint_violations)
+            np.save(self.results_dir / f"constraint_violations{self.evaluations_count}", visualization_constraint_violations)
 
         visualization_mus = np.stack(visualization_mus)
-        np.save(self.results_dir / f"mu_trajectories{self.count_evaluations}", visualization_mus)
+        np.save(self.results_dir / f"mu_trajectories{self.evaluations_count}", visualization_mus)
 
-        if self.env_name == "vehicle_repositioning_sequential":
+        if self.env_name == "vehicle-repositioning-sequential":
             visualization_demand_mus = np.stack(visualization_demand_mus)
-            np.save(self.results_dir / f"demand_mu_trajectories{self.count_evaluations}", visualization_demand_mus)
+            np.save(self.results_dir / f"demand_mu_trajectories{self.evaluations_count}", visualization_demand_mus)
 
         if self.exec_type == "eval":
             visualization_ra_states = np.stack(visualization_ra_states)
-            np.save(self.results_dir / f"ra_states{self.count_evaluations}", visualization_ra_states)
-            if self.env_name == "vehicle_repositioning_sequential":
+            np.save(self.results_dir / f"ra_states{self.evaluations_count}", visualization_ra_states)
+            if self.env_name == "vehicle-repositioning-sequential":
                 visualization_ra_demand_states = np.stack(visualization_ra_demand_states)
-                np.save(self.results_dir / f"ra_demand_states{self.count_evaluations}", visualization_ra_demand_states)
-
-        self.count_evaluations += 1
+                np.save(self.results_dir / f"ra_demand_states{self.evaluations_count}", visualization_ra_demand_states)
 
         if train_dynamics:
             current_states = torch.cat(train_current_states, dim=0).to(self.device)
@@ -302,11 +321,14 @@ class SafeMFMARL:
         n_episodes: int,
         n_repeats: int = 10,
     ):
-        self._warmup(warmup_steps)
+        self._warmup(warmup_steps, horizon)
         opt_policy = self.model.policy
         best_policy = opt_policy
         best_reward = -torch.inf
-        for i in range(n_episodes):
+        torch.save(self.env.dynamics, f"{self.dynamics_ckpt_dir}/dynamics{self.evaluations_count}.pt")
+        torch.save(opt_policy, f"{self.policy_ckpt_dir}/policy{self.evaluations_count}.pt")
+        torch.save(best_policy, f"{self.policy_ckpt_dir}/policy_best{self.evaluations_count}.pt")
+        for _ in range(n_episodes):
             avg_reward = self._evaluate(
                 horizon,
                 opt_policy,
@@ -316,14 +338,14 @@ class SafeMFMARL:
             if avg_reward > best_reward:
                 best_reward = avg_reward
                 best_policy = deepcopy(opt_policy)
-                torch.save(best_policy, f"{self.policy_ckpt_dir}/policy_best{i}.pt")
-            torch.save(opt_policy, f"{self.policy_ckpt_dir}/policy{i}.pt")
-            torch.save(self.env.dynamics, f"{self.dynamics_ckpt_dir}/dynamics{i}.pt")
+                torch.save(best_policy, f"{self.policy_ckpt_dir}/policy_best{self.evaluations_count}.pt")
+            self.evaluations_count += 1
+            torch.save(self.env.dynamics, f"{self.dynamics_ckpt_dir}/dynamics{self.evaluations_count}.pt")
             opt_policy = self.model.train(policy_epochs, horizon)
-
-        torch.save(best_policy, f"{self.policy_ckpt_dir}/policy_final.pt")
+            torch.save(opt_policy, f"{self.policy_ckpt_dir}/policy{self.evaluations_count}.pt")
         torch.save(self.env.dynamics, f"{self.dynamics_ckpt_dir}/dynamics_final.pt")
-
+        torch.save(best_policy, f"{self.policy_ckpt_dir}/policy_final.pt")
+    
 
     def run(
         self,
