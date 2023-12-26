@@ -1,0 +1,13 @@
+cff-version: 0.0.1
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Jusup"
+  given-names: "Matej"
+  orcid: "https://orcid.org/0000-0002-3779-5041"
+- family-names: "Janik"
+  given-names: "Tadeusz"
+title: "Safe Model-Based Multi-Agent Mean-Field Reinforcement Learning"
+version: 0.0.1
+doi: 10.5281/zenodo.10431636
+date-released: 2023-12-26
+url: "https://github.com/mjusup1501/safe-m3-ucrl"
