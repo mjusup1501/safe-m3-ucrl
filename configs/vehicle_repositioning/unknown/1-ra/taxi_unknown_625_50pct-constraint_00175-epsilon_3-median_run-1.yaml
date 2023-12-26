@@ -1,0 +1,51 @@
+env_name: vehicle-repositioning-sequential
+logging: offline
+device: cuda:0
+entity: user
+logdir: 
+run_id: 20230516
+dynamics_ckpt: 
+policy_ckpt:
+exec_type: train
+
+model:
+  mu_dim: 625
+  input_data_path: 
+  control_std: 0.0175
+  constraint_lipschitz: 0.1
+  max_entropy_ratio: 0.5 # pct of max entropy
+  barrier_lambda: 1.0
+  demand_move: True
+  dynamics_type: unknown
+  num_agents: 1
+  reward_type: current_mu
+
+  dynamics:
+    beta: 1.0             
+    ensemble_nets: 10
+    hidden_dims: [16, 16]
+    lr: 0.0001
+    weight_decay: 0.0005
+    dynamics_epochs: 10_000
+    buffer_size: 100
+    reset_params_every_episode: False
+    batch_size: 8
+    holdout: 0.9    # 90% train, 10% validation
+
+  solver:
+    policy:
+      lr: 0.0001
+      hidden_dims: [256, 256]
+      weight_decay: 0.0005
+    reset_params_every_episode: False
+    patience: 5
+    exploration_decay:
+    polar: false
+    gmm: false
+
+training:
+  n_episodes: 1_000
+  horizon: 12 # 100
+  policy_epochs: 20_000 # 300
+  warmup_steps: 0
+  n_repeats: 1
